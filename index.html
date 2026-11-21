@@ -340,6 +340,7 @@
   const BASE_POLL_MS = 30000;               // 正常轮询间隔 30 秒
   const MAX_POLL_MS = 120000;               // 异常退避上限 120 秒
   const MANUAL_REFRESH_COOLDOWN_MS = 3000;  // 手动刷新按钮防连点 3 秒
+  const VISIBILITY_REFRESH_COOLDOWN_MS = 15000; // 切回前台自动刷新冷却 15 秒
   const MAX_PHOTO_CACHE = 30;               // 内存图片缓存上限（LRU 淘汰）
   const MAX_UPLOAD_FILE_BYTES = 25 * 1024 * 1024; // 拒绝超过 25MB 的异常文件
   const MAX_PHOTO_DATAURL_LEN = 140000;     // 压缩后 Base64 上限（约 100KB，与数据库约束匹配）
@@ -363,10 +364,14 @@
       options.headers || {}
     );
 
-    const tryOrder = [
-      activeEndpointIndex,
-      ...SUPABASE_ENDPOINTS.map((_, idx) => idx).filter((idx) => idx !== activeEndpointIndex)
-    ];
+    const method = (options.method || 'GET').toUpperCase();
+    const allowRetry = options.retryOnFail !== undefined ? Boolean(options.retryOnFail) : method === 'GET';
+    const tryOrder = allowRetry
+      ? [
+          activeEndpointIndex,
+          ...SUPABASE_ENDPOINTS.map((_, idx) => idx).filter((idx) => idx !== activeEndpointIndex)
+        ]
+      : [activeEndpointIndex];
 
     let lastErr = null;
     for (let i = 0; i < tryOrder.length; i++) {
@@ -593,12 +598,14 @@
   let pendingCoords = { x: 0, y: 0 };
   let compressedBase64 = '';
   let isCompressingPhoto = false;
+  let photoTaskId = 0;
   let isSubmitting = false;
   let isFetching = false;
   let supportsHasPhotoColumn = true;
   let consecutiveErrors = 0;
   let pollTimer = null;
   let lastManualRefreshTime = 0;
+  let lastFetchSuccessTime = 0;
 
   const photoCache = new Map();
   const inflightPhotoRequests = new Map();
@@ -670,6 +677,7 @@
       }));
 
       consecutiveErrors = 0;
+      lastFetchSuccessTime = Date.now();
       updateLatencyBadge('ok', latencyMs);
       renderPins();
     } catch (err) {
@@ -690,6 +698,7 @@
   let scale = 0.6;
   let panX = 20;
   let panY = 20;
+  let hasUserInteractedWithMap = false;
 
   const activePointers = new Map();
   let isDragging = false;
@@ -713,9 +722,31 @@
     const pinScale = Math.min(1.45, Math.max(0.55, 1 / scale));
     container.style.setProperty('--pin-scale', pinScale.toFixed(3));
   }
-  updateTransform();
+
+  function fitMapToViewport() {
+    const vpRect = viewport.getBoundingClientRect();
+    const imgW = mapImg.offsetWidth || 800;
+    const imgH = mapImg.offsetHeight || 900;
+    if (vpRect.width <= 0 || vpRect.height <= 0) {
+      scale = 0.6;
+      panX = 20;
+      panY = 20;
+    } else {
+      const fitScale = Math.min((vpRect.width - 24) / imgW, (vpRect.height - 24) / imgH);
+      scale = clampScale(Math.min(1, fitScale));
+      panX = (vpRect.width - imgW * scale) / 2;
+      panY = (vpRect.height - imgH * scale) / 2;
+    }
+    updateTransform();
+  }
+
+  mapImg.addEventListener('load', () => {
+    if (!hasUserInteractedWithMap) fitMapToViewport();
+  });
+  fitMapToViewport();
 
   function zoomAtClientPoint(newScale, clientX, clientY) {
+    hasUserInteractedWithMap = true;
     const clamped = clampScale(newScale);
     const vpRect = viewport.getBoundingClientRect();
     const vx = clientX - vpRect.left;
@@ -768,6 +799,7 @@
       const dy = e.clientY - downY;
       if (Math.hypot(dx, dy) > 6) {
         hasMoved = true;
+        hasUserInteractedWithMap = true;
       }
       panX = panStartX + dx;
       panY = panStartY + dy;
@@ -803,7 +835,7 @@
     }
 
     if (activePointers.size === 0) {
-      const shouldOpenModal = isDragging && !hasMoved && !e.target.closest('.pin');
+      const shouldOpenModal = e.type === 'pointerup' && isDragging && !hasMoved && !e.target.closest('.pin');
       isDragging = false;
       if (shouldOpenModal) {
         const rect = container.getBoundingClientRect();
@@ -848,10 +880,7 @@
   document.getElementById('zoom-in').addEventListener('click', () => zoomCenter(0.25));
   document.getElementById('zoom-out').addEventListener('click', () => zoomCenter(-0.25));
   document.getElementById('reset-view').addEventListener('click', () => {
-    scale = 0.6;
-    panX = 20;
-    panY = 20;
-    updateTransform();
+    fitMapToViewport();
   });
 
   // ================= 4. 渲染图钉与筛选（纯 DOM API，杜绝 XSS） =================
@@ -916,7 +945,7 @@
 
       el.addEventListener('click', (e) => {
         e.stopPropagation();
-        showDetail(pin, minsAgo);
+        showDetail(pin);
       });
 
       fragment.appendChild(el);
@@ -957,17 +986,24 @@
   }
 
   document.getElementById('photo-input').addEventListener('change', function (e) {
+    const taskId = ++photoTaskId;
     const file = e.target.files && e.target.files[0];
     const preview = document.getElementById('photo-preview');
     if (!file) {
+      isCompressingPhoto = false;
       compressedBase64 = '';
       preview.style.display = 'none';
+      submitBtn.disabled = false;
+      submitBtn.textContent = '发布队尾位置';
       return;
     }
     if (file.size > MAX_UPLOAD_FILE_BYTES) {
       e.target.value = '';
+      isCompressingPhoto = false;
       compressedBase64 = '';
       preview.style.display = 'none';
+      submitBtn.disabled = false;
+      submitBtn.textContent = '发布队尾位置';
       showToast('照片文件过大，请重新拍摄或选择较小图片');
       return;
     }
@@ -981,6 +1017,7 @@
     const img = new Image();
     img.onerror = () => {
       URL.revokeObjectURL(objectUrl);
+      if (taskId !== photoTaskId) return;
       isCompressingPhoto = false;
       compressedBase64 = '';
       submitBtn.disabled = false;
@@ -989,7 +1026,9 @@
     };
     img.onload = () => {
       try {
+        if (taskId !== photoTaskId) return;
         const dataUrl = compressImageToLimit(img);
+        if (taskId !== photoTaskId) return;
         if (dataUrl.length > MAX_PHOTO_DATAURL_LEN) {
           compressedBase64 = '';
           preview.style.display = 'none';
@@ -1000,14 +1039,17 @@
           preview.style.display = 'block';
         }
       } catch (_) {
+        if (taskId !== photoTaskId) return;
         compressedBase64 = '';
         preview.style.display = 'none';
         showToast('照片处理失败，可不带照片直接发布');
       } finally {
         URL.revokeObjectURL(objectUrl);
-        isCompressingPhoto = false;
-        submitBtn.disabled = false;
-        submitBtn.textContent = '发布队尾位置';
+        if (taskId === photoTaskId) {
+          isCompressingPhoto = false;
+          submitBtn.disabled = false;
+          submitBtn.textContent = '发布队尾位置';
+        }
       }
     };
     img.src = objectUrl;
@@ -1021,12 +1063,18 @@
       return;
     }
     pendingCoords = { x, y };
+    photoTaskId += 1;
     compressedBase64 = '';
     isCompressingPhoto = false;
     submitBtn.disabled = false;
     submitBtn.textContent = '发布队尾位置';
     document.getElementById('photo-input').value = '';
     document.getElementById('photo-preview').style.display = 'none';
+    if (currentFilter !== 'ALL' && VALID_PROJECTS.has(currentFilter)) {
+      projectTags.querySelectorAll('.tag-item').forEach((t) => {
+        t.classList.toggle('selected', t.dataset.val === currentFilter);
+      });
+    }
     document.getElementById('add-modal').classList.add('show');
   }
 
@@ -1062,7 +1110,7 @@
       status_text: statusText,
       x: pendingCoords.x,
       y: pendingCoords.y,
-      photo: compressedBase64
+      photo: compressedBase64 || null
     };
 
     try {
@@ -1091,8 +1139,9 @@
   submitBtn.addEventListener('click', submitPin);
 
   // 点击图钉按需懒加载单张 photo（带 LRU 缓存 + 防重复并发请求）
-  async function showDetail(pin, minsAgo) {
+  async function showDetail(pin) {
     activeDetailPinId = pin.id;
+    const minsAgo = Math.max(0, Math.floor((Date.now() - pin.time) / 60000));
     document.getElementById('detail-title').textContent = `${pin.project} - 队尾详情`;
     document.getElementById('detail-meta').textContent =
       `排队程度：${pin.statusText || '未知'} | 更新于 ${minsAgo === 0 ? '刚刚' : `${minsAgo}分钟前`}`;
@@ -1175,9 +1224,11 @@
     }
   });
 
-  // 页面切回前台时立即同步一次；切后台时自动跳过轮询
+  // 页面切回前台时按冷却间隔同步一次；切后台时自动跳过轮询
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) fetchPins(true);
+    if (!document.hidden && Date.now() - lastFetchSuccessTime >= VISIBILITY_REFRESH_COOLDOWN_MS) {
+      fetchPins(true);
+    }
   });
 
   // 页面加载后立即拉取数据（后续由 scheduleNextPoll 自动退避调度）
