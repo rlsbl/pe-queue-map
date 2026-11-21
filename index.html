@@ -31,14 +31,19 @@
   header h1 { font-size: 16px; font-weight: 600; color: #111; white-space: nowrap; }
   .tip {
     font-size: 12px;
-    color: #555;
+    color: #444;
     background: #f0f2f5;
     padding: 4px 10px;
     border-radius: 12px;
     white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    flex-shrink: 0;
+    font-variant-numeric: tabular-nums;
+    cursor: pointer;
+    user-select: none;
   }
+  .tip.latency-good { background: #ecfdf3; color: #15803d; }
+  .tip.latency-warn { background: #fff7ed; color: #c2410c; }
+  .tip.latency-bad  { background: #fef2f2; color: #b91c1c; }
 
   /* 筛选栏 */
   .filter-bar {
@@ -257,7 +262,7 @@
 
 <header>
   <h1>🏃 体测实时队尾地图</h1>
-  <span class="tip" id="sync-status">👆 点击地图任意处标出队尾</span>
+  <span class="tip" id="sync-status" title="点击刷新并重测网络延迟">⏳ -- ms</span>
 </header>
 
 <div class="filter-bar" id="filter-bar"></div>
@@ -442,6 +447,32 @@
     return typeof str === 'string' && /^data:image\/(jpeg|jpg|png|webp|gif);base64,[A-Za-z0-9+/=\s]+$/.test(str);
   }
 
+  // 右上角延迟显示更新（点击可手动刷新测速）
+  const statusTipEl = document.getElementById('sync-status');
+  function updateLatencyBadge(state, ms = null) {
+    statusTipEl.classList.remove('latency-good', 'latency-warn', 'latency-bad');
+    if (state === 'loading') {
+      statusTipEl.textContent = '⏳ 测速中...';
+      return;
+    }
+    if (state === 'error') {
+      statusTipEl.classList.add('latency-bad');
+      statusTipEl.textContent = '🔴 连接异常';
+      return;
+    }
+    const val = Math.max(1, Math.round(ms));
+    if (val < 300) {
+      statusTipEl.classList.add('latency-good');
+      statusTipEl.textContent = `🟢 ${val} ms`;
+    } else if (val < 800) {
+      statusTipEl.classList.add('latency-warn');
+      statusTipEl.textContent = `🟡 ${val} ms`;
+    } else {
+      statusTipEl.classList.add('latency-bad');
+      statusTipEl.textContent = `🔴 ${val} ms`;
+    }
+  }
+
   // ================= 渲染顶部筛选栏 & 弹窗标签（使用 DOM API 防 XSS） =================
   const filterBar = document.getElementById('filter-bar');
   let currentFilter = 'ALL';
@@ -556,7 +587,7 @@
   // 替换为你自己的卫星图路径；若同级目录暂无 map.png，会自动触发兜底跑道图
   mapImg.src = './map.png';
 
-  // ================= 2. 云端数据读写（限条数 + 退避轮询 + LRU 图片缓存） =================
+  // ================= 2. 云端数据读写（限条数 + 退避轮询 + LRU 图片缓存 + 延迟测速） =================
   let pinsData = [];
   let pendingCoords = { x: 0, y: 0 };
   let compressedBase64 = '';
@@ -597,8 +628,8 @@
     }
 
     isFetching = true;
-    const statusTip = document.getElementById('sync-status');
-    statusTip.textContent = '⏳ 同步中...';
+    if (force) updateLatencyBadge('loading');
+    const startedAt = performance.now();
 
     try {
       const thirtyFiveMinsAgo = new Date(Date.now() - 35 * 60000).toISOString();
@@ -622,6 +653,8 @@
         }
       }
 
+      const latencyMs = performance.now() - startedAt;
+
       // 按时间升序排列，保证最新图钉渲染在视觉最上层
       const rows = Array.isArray(data) ? data.slice().reverse() : [];
       pinsData = rows.map((row) => ({
@@ -636,12 +669,12 @@
       }));
 
       consecutiveErrors = 0;
-      statusTip.textContent = '👆 点击地图任意处标出队尾';
+      updateLatencyBadge('ok', latencyMs);
       renderPins();
     } catch (err) {
       console.error('拉取异常:', err);
       consecutiveErrors += 1;
-      statusTip.textContent = '⚠️ 网络异常，稍后自动重试';
+      updateLatencyBadge('error');
     } finally {
       isFetching = false;
       scheduleNextPoll();
@@ -798,8 +831,7 @@
     zoomAtClientPoint(scale + delta, vpRect.left + vpRect.width / 2, vpRect.top + vpRect.height / 2);
   }
 
-  const refreshBtn = document.getElementById('refresh-btn');
-  refreshBtn.addEventListener('click', () => {
+  function triggerManualRefresh() {
     const now = Date.now();
     if (now - lastManualRefreshTime < MANUAL_REFRESH_COOLDOWN_MS) {
       showToast('刚刚刷新过啦，稍等几秒再试');
@@ -808,7 +840,10 @@
     lastManualRefreshTime = now;
     consecutiveErrors = 0;
     fetchPins(true);
-  });
+  }
+
+  document.getElementById('refresh-btn').addEventListener('click', triggerManualRefresh);
+  statusTipEl.addEventListener('click', triggerManualRefresh);
   document.getElementById('zoom-in').addEventListener('click', () => zoomCenter(0.25));
   document.getElementById('zoom-out').addEventListener('click', () => zoomCenter(-0.25));
   document.getElementById('reset-view').addEventListener('click', () => {
