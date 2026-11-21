@@ -173,6 +173,7 @@
     justify-content: center;
   }
   .ctrl-btn:active { transform: scale(0.95); }
+  .ctrl-btn:disabled { opacity: 0.55; cursor: not-allowed; }
 
   /* 弹窗通用 */
   .modal-overlay {
@@ -263,7 +264,7 @@
 
 <div id="map-viewport">
   <div id="map-container">
-    <!-- 同级目录放置 map.png 作为卫星底图；加载失败会自动显示兜底跑道图 -->
+    <!-- 同级目录放置小写 map.png（建议压缩至 500KB 以内）；加载失败会自动显示兜底跑道图 -->
     <img id="map-img" alt="操场地图">
     <div id="pins-layer"></div>
   </div>
@@ -320,13 +321,22 @@
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
 <script>
-  // ================= Supabase REST API 配置（零外部 CDN，优先自定义反代域名，自动容错回退） =================
+  // ================= Supabase REST API 配置（零外部 CDN，优先反代，超时/429/5xx 自动回退） =================
   const SUPABASE_ENDPOINTS = [
     'https://pe-api.rlsbl.cc.cd',
     'https://ihvervlbgwtrxwvneqqc.supabase.co'
   ];
   const SUPABASE_KEY = 'sb_publishable_AtmflmhQfranf1FBvkO60Q_qMWMDei7';
   let activeEndpointIndex = 0;
+
+  // 加固参数集中配置
+  const MAX_PINS_FETCH = 200;               // 单次最多拉取 200 条，防恶意刷库撑爆前端 DOM
+  const BASE_POLL_MS = 30000;               // 正常轮询间隔 30 秒
+  const MAX_POLL_MS = 120000;               // 异常退避上限 120 秒
+  const MANUAL_REFRESH_COOLDOWN_MS = 3000;  // 手动刷新按钮防连点 3 秒
+  const MAX_PHOTO_CACHE = 30;               // 内存图片缓存上限（LRU 淘汰）
+  const MAX_UPLOAD_FILE_BYTES = 25 * 1024 * 1024; // 拒绝超过 25MB 的异常文件
+  const MAX_PHOTO_DATAURL_LEN = 140000;     // 压缩后 Base64 上限（约 100KB，与数据库约束匹配）
 
   async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
     const controller = new AbortController();
@@ -347,24 +357,23 @@
       options.headers || {}
     );
 
-    // 优先使用当前可用节点；遇到超时或网络拦截时自动尝试备用节点
     const tryOrder = [
       activeEndpointIndex,
       ...SUPABASE_ENDPOINTS.map((_, idx) => idx).filter((idx) => idx !== activeEndpointIndex)
     ];
 
-    let lastNetworkErr = null;
-    for (const idx of tryOrder) {
+    let lastErr = null;
+    for (let i = 0; i < tryOrder.length; i++) {
+      const idx = tryOrder[i];
+      const hasNextEndpoint = i < tryOrder.length - 1;
       const endpoint = `${SUPABASE_ENDPOINTS[idx]}/rest/v1/queue_pins${queryString}`;
       let res;
       try {
         res = await fetchWithTimeout(endpoint, Object.assign({}, options, { headers }), 8000);
       } catch (err) {
-        lastNetworkErr = err;
+        lastErr = err;
         continue;
       }
-
-      activeEndpointIndex = idx;
 
       if (!res.ok) {
         let msg = `HTTP ${res.status}`;
@@ -374,15 +383,24 @@
             msg = errBody.message || errBody.error;
           }
         } catch (_) {}
-        throw new Error(msg);
+
+        const err = new Error(msg);
+        // 反代限流 (429) 或服务端故障 (5xx) 时自动切换备用节点
+        if (hasNextEndpoint && (res.status === 429 || res.status >= 500)) {
+          lastErr = err;
+          continue;
+        }
+        throw err;
       }
 
+      // 仅在请求真正成功时锁定当前可用节点
+      activeEndpointIndex = idx;
       if (res.status === 204) return null;
       const text = await res.text();
       return text ? JSON.parse(text) : null;
     }
 
-    throw lastNetworkErr || new Error('网络连接失败，请稍后重试');
+    throw lastErr || new Error('网络连接失败，请稍后重试');
   }
 
   // ================= 0. 体测项目统一配置（后续增减项目只需改这里，并同步 SQL 约束） =================
@@ -396,6 +414,7 @@
     '50米',
     '800/1000米'
   ];
+  const VALID_PROJECTS = new Set(PROJECTS);
   const VALID_STATUSES = new Set(['low', 'mid', 'high']);
   // 正式版防刷屏冷却时间：3 分钟（180000 毫秒）
   const POST_COOLDOWN_MS = 180000;
@@ -537,19 +556,45 @@
   // 替换为你自己的卫星图路径；若同级目录暂无 map.png，会自动触发兜底跑道图
   mapImg.src = './map.png';
 
-  // ================= 2. 云端数据读写（省流量：列表不拉 photo，点击再懒加载） =================
+  // ================= 2. 云端数据读写（限条数 + 退避轮询 + LRU 图片缓存） =================
   let pinsData = [];
   let pendingCoords = { x: 0, y: 0 };
   let compressedBase64 = '';
   let isCompressingPhoto = false;
+  let isSubmitting = false;
   let isFetching = false;
   let supportsHasPhotoColumn = true;
+  let consecutiveErrors = 0;
+  let pollTimer = null;
+  let lastManualRefreshTime = 0;
+
   const photoCache = new Map();
+  const inflightPhotoRequests = new Map();
   let activeDetailPinId = null;
+
+  function setPhotoCache(id, value) {
+    if (photoCache.has(id)) photoCache.delete(id);
+    photoCache.set(id, value);
+    while (photoCache.size > MAX_PHOTO_CACHE) {
+      const oldestKey = photoCache.keys().next().value;
+      photoCache.delete(oldestKey);
+    }
+  }
+
+  function scheduleNextPoll() {
+    if (pollTimer) clearTimeout(pollTimer);
+    // 连续报错时自动退避（30s -> 60s -> 120s），加 0~3s 随机抖动防惊群并发
+    const backoff = Math.min(MAX_POLL_MS, BASE_POLL_MS * Math.pow(2, Math.min(consecutiveErrors, 2)));
+    const jitter = Math.floor(Math.random() * 3000);
+    pollTimer = setTimeout(() => fetchPins(false), backoff + jitter);
+  }
 
   async function fetchPins(force = false) {
     if (isFetching) return;
-    if (!force && document.hidden) return;
+    if (!force && document.hidden) {
+      scheduleNextPoll();
+      return;
+    }
 
     isFetching = true;
     const statusTip = document.getElementById('sync-status');
@@ -561,7 +606,7 @@
         const fields = withHasPhoto
           ? 'id,project,status,status_text,x,y,created_at,has_photo'
           : 'id,project,status,status_text,x,y,created_at';
-        return `?select=${fields}&created_at=gte.${encodeURIComponent(thirtyFiveMinsAgo)}&order=created_at.asc`;
+        return `?select=${fields}&created_at=gte.${encodeURIComponent(thirtyFiveMinsAgo)}&order=created_at.desc&limit=${MAX_PINS_FETCH}`;
       };
 
       let data;
@@ -577,7 +622,9 @@
         }
       }
 
-      pinsData = (Array.isArray(data) ? data : []).map((row) => ({
+      // 按时间升序排列，保证最新图钉渲染在视觉最上层
+      const rows = Array.isArray(data) ? data.slice().reverse() : [];
+      pinsData = rows.map((row) => ({
         id: row.id,
         project: String(row.project || ''),
         status: VALID_STATUSES.has(row.status) ? row.status : 'mid',
@@ -588,13 +635,16 @@
         hasPhoto: supportsHasPhotoColumn ? Boolean(row.has_photo) : null
       }));
 
+      consecutiveErrors = 0;
       statusTip.textContent = '👆 点击地图任意处标出队尾';
       renderPins();
     } catch (err) {
       console.error('拉取异常:', err);
+      consecutiveErrors += 1;
       statusTip.textContent = '⚠️ 网络异常，稍后自动重试';
     } finally {
       isFetching = false;
+      scheduleNextPoll();
     }
   }
 
@@ -636,7 +686,6 @@
     const vpRect = viewport.getBoundingClientRect();
     const vx = clientX - vpRect.left;
     const vy = clientY - vpRect.top;
-    // 保持指针下方地图点位置不变
     const mapX = (vx - panX) / scale;
     const mapY = (vy - panY) / scale;
     scale = clamped;
@@ -709,7 +758,6 @@
     activePointers.delete(e.pointerId);
 
     if (activePointers.size === 1) {
-      // 双指松开一根手指：平滑切回单指拖拽，不跳变、不误触弹窗
       const remaining = Array.from(activePointers.values())[0];
       isDragging = true;
       hasMoved = true;
@@ -750,7 +798,17 @@
     zoomAtClientPoint(scale + delta, vpRect.left + vpRect.width / 2, vpRect.top + vpRect.height / 2);
   }
 
-  document.getElementById('refresh-btn').addEventListener('click', () => fetchPins(true));
+  const refreshBtn = document.getElementById('refresh-btn');
+  refreshBtn.addEventListener('click', () => {
+    const now = Date.now();
+    if (now - lastManualRefreshTime < MANUAL_REFRESH_COOLDOWN_MS) {
+      showToast('刚刚刷新过啦，稍等几秒再试');
+      return;
+    }
+    lastManualRefreshTime = now;
+    consecutiveErrors = 0;
+    fetchPins(true);
+  });
   document.getElementById('zoom-in').addEventListener('click', () => zoomCenter(0.25));
   document.getElementById('zoom-out').addEventListener('click', () => zoomCenter(-0.25));
   document.getElementById('reset-view').addEventListener('click', () => {
@@ -768,6 +826,7 @@
 
     let visiblePins = pinsData.filter((pin) => {
       if (!Number.isFinite(pin.x) || !Number.isFinite(pin.y)) return false;
+      if (pin.x < 0 || pin.x > 100 || pin.y < 0 || pin.y > 100) return false;
       const minsAgo = Math.max(0, Math.floor((now - pin.time) / 60000));
       if (minsAgo > 30) return false;
       if (currentFilter !== 'ALL' && pin.project !== currentFilter) return false;
@@ -785,6 +844,7 @@
       visiblePins = Array.from(latestMap.values());
     }
 
+    const fragment = document.createDocumentFragment();
     visiblePins.forEach((pin) => {
       const minsAgo = Math.max(0, Math.floor((now - pin.time) / 60000));
       const safeStatus = VALID_STATUSES.has(pin.status) ? pin.status : 'mid';
@@ -823,12 +883,42 @@
         showDetail(pin, minsAgo);
       });
 
-      layer.appendChild(el);
+      fragment.appendChild(el);
     });
+    layer.appendChild(fragment);
   }
 
-  // ================= 5. 表单交互与图片前端压缩 =================
+  // ================= 5. 表单交互与省内存自适应压缩 =================
   const submitBtn = document.getElementById('submit-btn');
+
+  function compressImageToLimit(img) {
+    const steps = [
+      { maxW: 600, quality: 0.7 },
+      { maxW: 600, quality: 0.52 },
+      { maxW: 480, quality: 0.45 },
+      { maxW: 400, quality: 0.35 }
+    ];
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    let result = '';
+
+    for (const step of steps) {
+      const ratio = img.width > 0 ? Math.min(1, step.maxW / img.width) : 1;
+      canvas.width = Math.max(1, Math.round(img.width * ratio));
+      canvas.height = Math.max(1, Math.round(img.height * ratio));
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      result = canvas.toDataURL('image/jpeg', step.quality);
+      if (result.length <= MAX_PHOTO_DATAURL_LEN) {
+        break;
+      }
+    }
+
+    // 主动释放 Canvas 显存/内存
+    canvas.width = 0;
+    canvas.height = 0;
+    return result;
+  }
 
   document.getElementById('photo-input').addEventListener('change', function (e) {
     const file = e.target.files && e.target.files[0];
@@ -838,43 +928,53 @@
       preview.style.display = 'none';
       return;
     }
+    if (file.size > MAX_UPLOAD_FILE_BYTES) {
+      e.target.value = '';
+      compressedBase64 = '';
+      preview.style.display = 'none';
+      showToast('照片文件过大，请重新拍摄或选择较小图片');
+      return;
+    }
 
     isCompressingPhoto = true;
     submitBtn.disabled = true;
     submitBtn.textContent = '正在压缩照片...';
 
-    const reader = new FileReader();
-    reader.onerror = () => {
+    // 使用 ObjectURL 替代 FileReader DataURL，避免低端手机/微信内置浏览器 OOM 闪退
+    const objectUrl = URL.createObjectURL(file);
+    const img = new Image();
+    img.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
       isCompressingPhoto = false;
+      compressedBase64 = '';
       submitBtn.disabled = false;
       submitBtn.textContent = '发布队尾位置';
-      showToast('照片读取失败，请重试');
+      showToast('不支持的图片格式，请重新选择');
     };
-    reader.onload = function (event) {
-      const img = new Image();
-      img.onerror = () => {
+    img.onload = () => {
+      try {
+        const dataUrl = compressImageToLimit(img);
+        if (dataUrl.length > MAX_PHOTO_DATAURL_LEN) {
+          compressedBase64 = '';
+          preview.style.display = 'none';
+          showToast('照片压缩后仍偏大，已跳过附带照片');
+        } else {
+          compressedBase64 = dataUrl;
+          preview.src = compressedBase64;
+          preview.style.display = 'block';
+        }
+      } catch (_) {
+        compressedBase64 = '';
+        preview.style.display = 'none';
+        showToast('照片处理失败，可不带照片直接发布');
+      } finally {
+        URL.revokeObjectURL(objectUrl);
         isCompressingPhoto = false;
         submitBtn.disabled = false;
         submitBtn.textContent = '发布队尾位置';
-        showToast('不支持的图片格式，请重新选择');
-      };
-      img.onload = function () {
-        const c = document.createElement('canvas');
-        const maxW = 600;
-        const ratio = img.width > 0 ? Math.min(1, maxW / img.width) : 1;
-        c.width = Math.max(1, Math.round(img.width * ratio));
-        c.height = Math.max(1, Math.round(img.height * ratio));
-        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
-        compressedBase64 = c.toDataURL('image/jpeg', 0.7);
-        preview.src = compressedBase64;
-        preview.style.display = 'block';
-        isCompressingPhoto = false;
-        submitBtn.disabled = false;
-        submitBtn.textContent = '发布队尾位置';
-      };
-      img.src = event.target.result;
+      }
     };
-    reader.readAsDataURL(file);
+    img.src = objectUrl;
   });
 
   function openAddModal(x, y) {
@@ -895,20 +995,35 @@
   }
 
   async function submitPin() {
+    if (isSubmitting) return;
     if (isCompressingPhoto) {
       showToast('照片仍在压缩中，请稍等一下');
       return;
     }
 
+    const projectEl = document.querySelector('#project-tags .selected');
+    const statusEl = document.querySelector('#status-tags .selected');
+    const project = projectEl ? projectEl.dataset.val : PROJECTS[0];
+    const status = statusEl ? statusEl.dataset.val : 'low';
+    const statusText = statusEl ? statusEl.dataset.text : '人少(<10分)';
+
+    if (!VALID_PROJECTS.has(project) || !VALID_STATUSES.has(status)) {
+      showToast('项目或状态无效，请重新选择');
+      return;
+    }
+    if (!Number.isFinite(pendingCoords.x) || !Number.isFinite(pendingCoords.y)) {
+      showToast('坐标异常，请重新点击地图');
+      return;
+    }
+
+    isSubmitting = true;
     submitBtn.disabled = true;
     submitBtn.textContent = '正在发布...';
 
-    const projectEl = document.querySelector('#project-tags .selected');
-    const statusEl = document.querySelector('#status-tags .selected');
     const payload = {
-      project: projectEl ? projectEl.dataset.val : PROJECTS[0],
-      status: statusEl ? statusEl.dataset.val : 'low',
-      status_text: statusEl ? statusEl.dataset.text : '人少(<10分)',
+      project,
+      status,
+      status_text: statusText,
       x: pendingCoords.x,
       y: pendingCoords.y,
       photo: compressedBase64
@@ -932,13 +1047,14 @@
       console.error('提交异常:', err);
       showToast('发布失败：' + (err.message || '网络异常'), 3600);
     } finally {
+      isSubmitting = false;
       submitBtn.disabled = false;
       submitBtn.textContent = '发布队尾位置';
     }
   }
   submitBtn.addEventListener('click', submitPin);
 
-  // 点击图钉按需懒加载单张 photo（带内存缓存）
+  // 点击图钉按需懒加载单张 photo（带 LRU 缓存 + 防重复并发请求）
   async function showDetail(pin, minsAgo) {
     activeDetailPinId = pin.id;
     document.getElementById('detail-title').textContent = `${pin.project} - 队尾详情`;
@@ -955,9 +1071,10 @@
     // 明确无图时直接不发请求
     if (pin.hasPhoto === false) return;
 
-    // 优先读本地缓存
+    // 优先读本地 LRU 缓存
     if (photoCache.has(pin.id)) {
       const cached = photoCache.get(pin.id);
+      setPhotoCache(pin.id, cached); // 刷新最近访问顺序
       if (isSafeDataImage(cached)) {
         img.src = cached;
         img.style.display = 'block';
@@ -969,16 +1086,23 @@
     photoStatus.style.display = 'block';
 
     try {
-      const data = await sbRestFetch(
-        `?select=photo&id=eq.${encodeURIComponent(pin.id)}&limit=1`,
-        { method: 'GET' }
-      );
+      let req = inflightPhotoRequests.get(pin.id);
+      if (!req) {
+        req = sbRestFetch(
+          `?select=photo&id=eq.${encodeURIComponent(pin.id)}&limit=1`,
+          { method: 'GET' }
+        ).finally(() => {
+          inflightPhotoRequests.delete(pin.id);
+        });
+        inflightPhotoRequests.set(pin.id, req);
+      }
 
-      if (activeDetailPinId !== pin.id) return; // 用户已切换到别的弹窗或已关闭
+      const data = await req;
+      if (activeDetailPinId !== pin.id) return;
 
       const row = Array.isArray(data) && data.length > 0 ? data[0] : null;
       const photoStr = row && row.photo ? row.photo : '';
-      photoCache.set(pin.id, photoStr);
+      setPhotoCache(pin.id, photoStr);
 
       if (isSafeDataImage(photoStr)) {
         photoStatus.style.display = 'none';
@@ -1020,9 +1144,8 @@
     if (!document.hidden) fetchPins(true);
   });
 
-  // 页面加载后立即拉取数据，并每 30 秒自动刷新一次（仅在前台运行）
+  // 页面加载后立即拉取数据（后续由 scheduleNextPoll 自动退避调度）
   fetchPins(true);
-  setInterval(() => fetchPins(false), 30000);
 </script>
 </body>
 </html>
