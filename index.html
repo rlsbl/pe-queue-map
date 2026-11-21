@@ -1,0 +1,990 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>体测实时排队地图 - 众包互助</title>
+<!-- 引入 Supabase SDK -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #1a1a1a;
+    color: #333;
+    overflow: hidden;
+    height: 100vh;
+    height: 100dvh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* 顶部栏 */
+  header {
+    background: #fff;
+    padding: 10px 15px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    z-index: 10;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+  }
+  header h1 { font-size: 16px; font-weight: 600; color: #111; white-space: nowrap; }
+  .tip {
+    font-size: 12px;
+    color: #555;
+    background: #f0f2f5;
+    padding: 4px 10px;
+    border-radius: 12px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* 筛选栏 */
+  .filter-bar {
+    background: #fff;
+    padding: 8px 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    overflow-x: auto;
+    border-top: 1px solid #eee;
+    z-index: 10;
+    scrollbar-width: none;
+  }
+  .filter-bar::-webkit-scrollbar { display: none; }
+  .filter-btn {
+    border: 1px solid #ddd;
+    background: #fff;
+    color: #333;
+    padding: 5px 11px;
+    border-radius: 15px;
+    font-size: 12px;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .filter-btn.active { background: #007AFF; color: #fff; border-color: #007AFF; }
+  .filter-divider { width: 1px; height: 18px; background: #e5e7eb; flex-shrink: 0; }
+  .latest-toggle {
+    border: 1px solid #d1d5db;
+    background: #f9fafb;
+    color: #374151;
+    padding: 5px 10px;
+    border-radius: 15px;
+    font-size: 12px;
+    white-space: nowrap;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .latest-toggle.active { background: #111827; color: #fff; border-color: #111827; }
+
+  /* 地图容器 */
+  #map-viewport {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+    touch-action: none;
+    background: #2c3e50;
+    cursor: grab;
+    user-select: none;
+  }
+  #map-viewport:active { cursor: grabbing; }
+  #map-container {
+    position: absolute;
+    left: 0;
+    top: 0;
+    transform-origin: 0 0;
+    will-change: transform;
+    --pin-scale: 1;
+  }
+  #map-img {
+    display: block;
+    width: 800px;
+    height: auto;
+    pointer-events: none;
+    user-select: none;
+  }
+
+  /* 地图图钉 (Pin) - 反向缩放保持视觉大小稳定 */
+  .pin {
+    position: absolute;
+    transform-origin: 50% 100%;
+    transform: translate(-50%, -100%) scale(var(--pin-scale));
+    cursor: pointer;
+    z-index: 5;
+    transition: filter 0.15s;
+  }
+  .pin:hover {
+    filter: brightness(1.06);
+    z-index: 6;
+  }
+  .pin-badge {
+    padding: 4px 8px;
+    border-radius: 12px;
+    color: #fff;
+    font-size: 12px;
+    font-weight: bold;
+    white-space: nowrap;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    border: 2px solid #fff;
+  }
+  .pin-time { font-weight: normal; font-size: 11px; opacity: 0.95; }
+  .pin-arrow {
+    width: 0;
+    height: 0;
+    border-left: 6px solid transparent;
+    border-right: 6px solid transparent;
+    border-top: 8px solid #fff;
+    margin: 0 auto;
+  }
+
+  /* 状态颜色 */
+  .status-low { background: #28a745; }    /* 人少 */
+  .status-mid { background: #ff9800; }    /* 一般 */
+  .status-high { background: #dc3545; }   /* 爆满 */
+
+  /* 底部控制栏 */
+  .controls {
+    position: fixed;
+    bottom: max(20px, env(safe-area-inset-bottom));
+    right: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    z-index: 10;
+  }
+  .ctrl-btn {
+    width: 42px;
+    height: 42px;
+    border-radius: 50%;
+    background: #fff;
+    color: #222;
+    border: none;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.22);
+    font-size: 18px;
+    font-weight: bold;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .ctrl-btn:active { transform: scale(0.95); }
+
+  /* 弹窗通用 */
+  .modal-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.5);
+    z-index: 100;
+    align-items: flex-end;
+    justify-content: center;
+  }
+  .modal-overlay.show { display: flex; }
+  .modal-card {
+    background: #fff;
+    width: 100%;
+    max-width: 500px;
+    max-height: 85dvh;
+    overflow-y: auto;
+    border-radius: 16px 16px 0 0;
+    padding: 20px 20px max(20px, env(safe-area-inset-bottom));
+    animation: slideUp 0.2s ease-out;
+  }
+  @keyframes slideUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
+
+  .modal-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
+  .modal-title { font-size: 17px; font-weight: bold; color: #111; }
+  .close-btn { background: none; border: none; font-size: 24px; line-height: 1; color: #999; cursor: pointer; padding: 4px; }
+
+  /* 表单标签选择 */
+  .form-group { margin-bottom: 15px; }
+  .form-label { display: block; font-size: 13px; color: #666; margin-bottom: 8px; }
+  .tag-group { display: flex; flex-wrap: wrap; gap: 8px; }
+  .tag-item {
+    padding: 6px 12px;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    font-size: 13px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .tag-item.selected { background: #e6f2ff; border-color: #007AFF; color: #007AFF; font-weight: 600; }
+
+  .submit-btn {
+    width: 100%;
+    padding: 12px;
+    background: #007AFF;
+    color: #fff;
+    border: none;
+    border-radius: 10px;
+    font-size: 15px;
+    font-weight: bold;
+    cursor: pointer;
+  }
+  .submit-btn:disabled { background: #99c7ff; cursor: not-allowed; }
+  .preview-img { max-width: 100%; max-height: 260px; border-radius: 8px; margin-top: 8px; display: block; object-fit: contain; }
+  .detail-meta { font-size: 13px; color: #555; margin-bottom: 10px; line-height: 1.5; }
+  .detail-photo-status { font-size: 13px; color: #666; padding: 14px 0; text-align: center; }
+
+  /* 轻提示 Toast（替代原生 alert） */
+  .toast {
+    position: fixed;
+    top: 64px;
+    left: 50%;
+    transform: translateX(-50%) translateY(-10px);
+    background: rgba(17, 24, 39, 0.92);
+    color: #fff;
+    padding: 9px 16px;
+    border-radius: 20px;
+    font-size: 13px;
+    z-index: 200;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s, transform 0.2s;
+    max-width: 88vw;
+    text-align: center;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🏃 体测实时队尾地图</h1>
+  <span class="tip" id="sync-status">👆 点击地图任意处标出队尾</span>
+</header>
+
+<div class="filter-bar" id="filter-bar"></div>
+
+<div id="map-viewport">
+  <div id="map-container">
+    <!-- 替换 src 为你的卫星图路径，例如 "./map.png"；加载失败会自动显示兜底跑道图 -->
+    <img id="map-img" alt="操场地图">
+    <div id="pins-layer"></div>
+  </div>
+</div>
+
+<div class="controls">
+  <button class="ctrl-btn" id="refresh-btn" title="刷新数据" style="font-size:15px;">🔄</button>
+  <button class="ctrl-btn" id="zoom-in" title="放大">+</button>
+  <button class="ctrl-btn" id="zoom-out" title="缩小">-</button>
+  <button class="ctrl-btn" id="reset-view" title="复位视角" style="font-size:12px;">复位</button>
+</div>
+
+<!-- 新增标记弹窗 -->
+<div class="modal-overlay" id="add-modal">
+  <div class="modal-card">
+    <div class="modal-header">
+      <span class="modal-title">📍 标记当前队尾位置</span>
+      <button class="close-btn" data-close="add-modal" aria-label="关闭">&times;</button>
+    </div>
+    <div class="form-group">
+      <span class="form-label">1. 这是哪个项目的队伍？</span>
+      <div class="tag-group" id="project-tags"></div>
+    </div>
+    <div class="form-group">
+      <span class="form-label">2. 预计还要排多久？</span>
+      <div class="tag-group" id="status-tags">
+        <div class="tag-item selected" data-val="low" data-text="人少(<10分)">🟢 人少(&lt;10分)</div>
+        <div class="tag-item" data-val="mid" data-text="一般(15-30分)">🟠 一般(15-30分)</div>
+        <div class="tag-item" data-val="high" data-text="爆满(>30分)">🔴 爆满(&gt;30分)</div>
+      </div>
+    </div>
+    <div class="form-group">
+      <span class="form-label">3. 拍张队尾参照物（可选，自动压缩）</span>
+      <input type="file" id="photo-input" accept="image/*">
+      <img id="photo-preview" class="preview-img" alt="照片预览" style="display:none;">
+    </div>
+    <button class="submit-btn" id="submit-btn">发布队尾位置</button>
+  </div>
+</div>
+
+<!-- 查看详情弹窗 -->
+<div class="modal-overlay" id="detail-modal">
+  <div class="modal-card">
+    <div class="modal-header">
+      <span class="modal-title" id="detail-title">项目详情</span>
+      <button class="close-btn" data-close="detail-modal" aria-label="关闭">&times;</button>
+    </div>
+    <div class="detail-meta" id="detail-meta"></div>
+    <div class="detail-photo-status" id="detail-photo-status" style="display:none;"></div>
+    <img id="detail-img" class="preview-img" alt="队尾照片" style="display:none;">
+  </div>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script>
+  // ================= Supabase 配置 =================
+  const SUPABASE_URL = 'https://ihvervlbgwtrxwvneqqc.supabase.co';
+  const SUPABASE_KEY = 'sb_publishable_AtmflmhQfranf1FBvkO60Q_qMWMDei7';
+  const sbClient = window.supabase ? window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY) : null;
+
+  // ================= 0. 体测项目统一配置（后续增减项目只需改这里，并同步 SQL 约束） =================
+  const PROJECTS = [
+    '肺活量',
+    '身高/体重',
+    '坐位体前屈',
+    '立定跳远',
+    '仰卧起坐',
+    '引体向上',
+    '50米',
+    '800/1000米'
+  ];
+  const VALID_STATUSES = new Set(['low', 'mid', 'high']);
+  // 冷却限制：测试期间设为 10 秒，正式发论坛建议改为 180000（3分钟）
+  const POST_COOLDOWN_MS = 180000;
+
+  // 安全的 localStorage 封装
+  function safeGetStorage(key) {
+    try { return localStorage.getItem(key); } catch (_) { return null; }
+  }
+  function safeSetStorage(key, val) {
+    try { localStorage.setItem(key, String(val)); } catch (_) {}
+  }
+
+  // 轻提示 Toast
+  let toastTimer = null;
+  function showToast(msg, duration = 2600) {
+    const toast = document.getElementById('toast');
+    toast.textContent = msg;
+    toast.classList.add('show');
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toast.classList.remove('show'), duration);
+  }
+
+  // 校验安全的图片 Data URL（防止注入非图片或外链追踪）
+  function isSafeDataImage(str) {
+    return typeof str === 'string' && /^data:image\/(jpeg|jpg|png|webp|gif);base64,[A-Za-z0-9+/=\s]+$/.test(str);
+  }
+
+  // ================= 渲染顶部筛选栏 & 弹窗标签（使用 DOM API 防 XSS） =================
+  const filterBar = document.getElementById('filter-bar');
+  let currentFilter = 'ALL';
+  let onlyLatestPerProject = false;
+
+  function buildFilterBar() {
+    filterBar.textContent = '';
+
+    const allBtn = document.createElement('button');
+    allBtn.className = 'filter-btn active';
+    allBtn.dataset.filter = 'ALL';
+    allBtn.textContent = '全部项目';
+    filterBar.appendChild(allBtn);
+
+    PROJECTS.forEach((p) => {
+      const btn = document.createElement('button');
+      btn.className = 'filter-btn';
+      btn.dataset.filter = p;
+      btn.textContent = p;
+      filterBar.appendChild(btn);
+    });
+
+    const divider = document.createElement('div');
+    divider.className = 'filter-divider';
+    filterBar.appendChild(divider);
+
+    const latestBtn = document.createElement('button');
+    latestBtn.className = 'latest-toggle';
+    latestBtn.id = 'latest-toggle-btn';
+    latestBtn.textContent = '仅看最新';
+    latestBtn.title = '每个项目仅显示最新一条队尾标记';
+    latestBtn.addEventListener('click', () => {
+      onlyLatestPerProject = !onlyLatestPerProject;
+      latestBtn.classList.toggle('active', onlyLatestPerProject);
+      renderPins();
+    });
+    filterBar.appendChild(latestBtn);
+
+    filterBar.querySelectorAll('.filter-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        filterBar.querySelectorAll('.filter-btn').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        currentFilter = btn.dataset.filter;
+        renderPins();
+      });
+    });
+  }
+  buildFilterBar();
+
+  const projectTags = document.getElementById('project-tags');
+  function buildProjectTags() {
+    projectTags.textContent = '';
+    PROJECTS.forEach((p, idx) => {
+      const tag = document.createElement('div');
+      tag.className = 'tag-item' + (idx === 0 ? ' selected' : '');
+      tag.dataset.val = p;
+      tag.textContent = p;
+      projectTags.appendChild(tag);
+    });
+  }
+  buildProjectTags();
+
+  function setupTagGroup(id) {
+    const group = document.getElementById(id);
+    group.querySelectorAll('.tag-item').forEach((tag) => {
+      tag.addEventListener('click', () => {
+        group.querySelectorAll('.tag-item').forEach((t) => t.classList.remove('selected'));
+        tag.classList.add('selected');
+      });
+    });
+  }
+  setupTagGroup('project-tags');
+  setupTagGroup('status-tags');
+
+  // ================= 1. 初始化与底图加载兜底 =================
+  const mapImg = document.getElementById('map-img');
+
+  function createFallbackMapDataUrl() {
+    const canvas = document.createElement('canvas');
+    canvas.width = 800;
+    canvas.height = 900;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#5a6e58';
+    ctx.fillRect(0, 0, 800, 900);
+    ctx.fillStyle = '#a85248';
+    ctx.beginPath();
+    if (typeof ctx.roundRect === 'function') {
+      ctx.roundRect(220, 80, 480, 740, 240);
+    } else {
+      ctx.rect(220, 80, 480, 740);
+    }
+    ctx.fill();
+    ctx.fillStyle = '#4c8c4a';
+    ctx.fillRect(310, 220, 300, 460);
+    ctx.fillStyle = '#dcd7c9';
+    ctx.fillRect(140, 200, 70, 500);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 20px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('未找到 ./map.png（当前为默认占位操场图）', 400, 440);
+    ctx.font = '15px sans-serif';
+    ctx.fillText('请将卫星地图命名为 map.png 放在同级目录', 400, 472);
+    return canvas.toDataURL('image/png');
+  }
+
+  let fallbackApplied = false;
+  mapImg.addEventListener('error', () => {
+    if (fallbackApplied) return;
+    fallbackApplied = true;
+    mapImg.src = createFallbackMapDataUrl();
+  });
+  // 替换为你自己的卫星图路径；若同级目录暂无 map.png，会自动触发兜底跑道图
+  mapImg.src = './map.png';
+
+  // ================= 2. 云端数据读写（省流量：列表不拉 photo，点击再懒加载） =================
+  let pinsData = [];
+  let pendingCoords = { x: 0, y: 0 };
+  let compressedBase64 = '';
+  let isCompressingPhoto = false;
+  let isFetching = false;
+  let supportsHasPhotoColumn = true;
+  const photoCache = new Map();
+  let activeDetailPinId = null;
+
+  async function fetchPins(force = false) {
+    if (!sbClient) {
+      document.getElementById('sync-status').textContent = '⚠️ Supabase SDK 未加载';
+      return;
+    }
+    if (isFetching) return;
+    if (!force && document.hidden) return;
+
+    isFetching = true;
+    const statusTip = document.getElementById('sync-status');
+    statusTip.textContent = '⏳ 同步中...';
+
+    try {
+      const thirtyFiveMinsAgo = new Date(Date.now() - 35 * 60000).toISOString();
+      const selectFields = supportsHasPhotoColumn
+        ? 'id, project, status, status_text, x, y, created_at, has_photo'
+        : 'id, project, status, status_text, x, y, created_at';
+
+      let { data, error } = await sbClient
+        .from('queue_pins')
+        .select(selectFields)
+        .gte('created_at', thirtyFiveMinsAgo)
+        .order('created_at', { ascending: true });
+
+      // 若尚未执行升级 SQL（缺少 has_photo 字段），自动降级查询，不中断使用
+      if (error && supportsHasPhotoColumn && /has_photo/i.test(error.message || '')) {
+        supportsHasPhotoColumn = false;
+        const retry = await sbClient
+          .from('queue_pins')
+          .select('id, project, status, status_text, x, y, created_at')
+          .gte('created_at', thirtyFiveMinsAgo)
+          .order('created_at', { ascending: true });
+        data = retry.data;
+        error = retry.error;
+      }
+
+      if (error) {
+        console.error('拉取数据失败:', error);
+        statusTip.textContent = '⚠️ 同步失败，请检查网络或 RLS 权限';
+        return;
+      }
+
+      pinsData = (data || []).map((row) => ({
+        id: row.id,
+        project: String(row.project || ''),
+        status: VALID_STATUSES.has(row.status) ? row.status : 'mid',
+        statusText: String(row.status_text || ''),
+        x: Number(row.x),
+        y: Number(row.y),
+        time: new Date(row.created_at).getTime(),
+        hasPhoto: supportsHasPhotoColumn ? Boolean(row.has_photo) : null
+      }));
+
+      statusTip.textContent = '👆 点击地图任意处标出队尾';
+      renderPins();
+    } catch (err) {
+      console.error('拉取异常:', err);
+      statusTip.textContent = '⚠️ 网络异常，稍后自动重试';
+    } finally {
+      isFetching = false;
+    }
+  }
+
+  // ================= 3. 地图缩放与拖拽引擎（统一 Pointer Events，修复慢拖误触与双指冲突） =================
+  const viewport = document.getElementById('map-viewport');
+  const container = document.getElementById('map-container');
+  const MIN_SCALE = 0.4;
+  const MAX_SCALE = 3.0;
+  let scale = 0.6;
+  let panX = 20;
+  let panY = 20;
+
+  const activePointers = new Map();
+  let isDragging = false;
+  let downX = 0;
+  let downY = 0;
+  let panStartX = 0;
+  let panStartY = 0;
+  let hasMoved = false;
+  let pinchStartDist = 0;
+  let pinchStartScale = 1;
+  let pinchAnchorX = 0;
+  let pinchAnchorY = 0;
+
+  function clampScale(s) {
+    return Math.min(MAX_SCALE, Math.max(MIN_SCALE, s));
+  }
+
+  function updateTransform() {
+    container.style.transform = `translate(${panX}px, ${panY}px) scale(${scale})`;
+    // 反向缩放图钉（做轻度限幅，既清晰又不过分巨大）
+    const pinScale = Math.min(1.45, Math.max(0.55, 1 / scale));
+    container.style.setProperty('--pin-scale', pinScale.toFixed(3));
+  }
+  updateTransform();
+
+  function zoomAtClientPoint(newScale, clientX, clientY) {
+    const clamped = clampScale(newScale);
+    const vpRect = viewport.getBoundingClientRect();
+    const vx = clientX - vpRect.left;
+    const vy = clientY - vpRect.top;
+    // 保持指针下方地图点位置不变
+    const mapX = (vx - panX) / scale;
+    const mapY = (vy - panY) / scale;
+    scale = clamped;
+    panX = vx - mapX * scale;
+    panY = vy - mapY * scale;
+    updateTransform();
+  }
+
+  function getTwoPointers() {
+    const vals = Array.from(activePointers.values());
+    return [vals[0], vals[1]];
+  }
+
+  viewport.addEventListener('pointerdown', (e) => {
+    if (e.target.closest('.pin')) return;
+    viewport.setPointerCapture(e.pointerId);
+    activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    if (activePointers.size === 1) {
+      isDragging = true;
+      hasMoved = false;
+      downX = e.clientX;
+      downY = e.clientY;
+      panStartX = panX;
+      panStartY = panY;
+    } else if (activePointers.size === 2) {
+      isDragging = false;
+      hasMoved = true;
+      const [p1, p2] = getTwoPointers();
+      pinchStartDist = Math.hypot(p1.x - p2.x, p1.y - p2.y);
+      pinchStartScale = scale;
+      const vpRect = viewport.getBoundingClientRect();
+      const midX = (p1.x + p2.x) / 2 - vpRect.left;
+      const midY = (p1.y + p2.y) / 2 - vpRect.top;
+      pinchAnchorX = (midX - panX) / scale;
+      pinchAnchorY = (midY - panY) / scale;
+    }
+  });
+
+  viewport.addEventListener('pointermove', (e) => {
+    if (!activePointers.has(e.pointerId)) return;
+    activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    if (activePointers.size === 1 && isDragging) {
+      const dx = e.clientX - downX;
+      const dy = e.clientY - downY;
+      if (Math.hypot(dx, dy) > 6) {
+        hasMoved = true;
+      }
+      panX = panStartX + dx;
+      panY = panStartY + dy;
+      updateTransform();
+    } else if (activePointers.size === 2) {
+      const [p1, p2] = getTwoPointers();
+      const dist = Math.hypot(p1.x - p2.x, p1.y - p2.y);
+      if (pinchStartDist < 1) return;
+      const newScale = clampScale(pinchStartScale * (dist / pinchStartDist));
+      const vpRect = viewport.getBoundingClientRect();
+      const midX = (p1.x + p2.x) / 2 - vpRect.left;
+      const midY = (p1.y + p2.y) / 2 - vpRect.top;
+      scale = newScale;
+      panX = midX - pinchAnchorX * scale;
+      panY = midY - pinchAnchorY * scale;
+      updateTransform();
+    }
+  });
+
+  function handlePointerEnd(e) {
+    if (!activePointers.has(e.pointerId)) return;
+    activePointers.delete(e.pointerId);
+
+    if (activePointers.size === 1) {
+      // 双指松开一根手指：平滑切回单指拖拽，不跳变、不误触弹窗
+      const remaining = Array.from(activePointers.values())[0];
+      isDragging = true;
+      hasMoved = true;
+      downX = remaining.x;
+      downY = remaining.y;
+      panStartX = panX;
+      panStartY = panY;
+      return;
+    }
+
+    if (activePointers.size === 0) {
+      const shouldOpenModal = isDragging && !hasMoved && !e.target.closest('.pin');
+      isDragging = false;
+      if (shouldOpenModal) {
+        const rect = container.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) {
+          const relX = ((e.clientX - rect.left) / rect.width) * 100;
+          const relY = ((e.clientY - rect.top) / rect.height) * 100;
+          if (relX >= 0 && relX <= 100 && relY >= 0 && relY <= 100) {
+            openAddModal(Number(relX.toFixed(2)), Number(relY.toFixed(2)));
+          }
+        }
+      }
+    }
+  }
+
+  viewport.addEventListener('pointerup', handlePointerEnd);
+  viewport.addEventListener('pointercancel', handlePointerEnd);
+
+  viewport.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const factor = e.deltaY > 0 ? 0.9 : 1.1;
+    zoomAtClientPoint(scale * factor, e.clientX, e.clientY);
+  }, { passive: false });
+
+  function zoomCenter(delta) {
+    const vpRect = viewport.getBoundingClientRect();
+    zoomAtClientPoint(scale + delta, vpRect.left + vpRect.width / 2, vpRect.top + vpRect.height / 2);
+  }
+
+  document.getElementById('refresh-btn').addEventListener('click', () => fetchPins(true));
+  document.getElementById('zoom-in').addEventListener('click', () => zoomCenter(0.25));
+  document.getElementById('zoom-out').addEventListener('click', () => zoomCenter(-0.25));
+  document.getElementById('reset-view').addEventListener('click', () => {
+    scale = 0.6;
+    panX = 20;
+    panY = 20;
+    updateTransform();
+  });
+
+  // ================= 4. 渲染图钉与筛选（纯 DOM API，杜绝 XSS） =================
+  function renderPins() {
+    const layer = document.getElementById('pins-layer');
+    layer.textContent = '';
+    const now = Date.now();
+
+    let visiblePins = pinsData.filter((pin) => {
+      if (!Number.isFinite(pin.x) || !Number.isFinite(pin.y)) return false;
+      const minsAgo = Math.max(0, Math.floor((now - pin.time) / 60000));
+      if (minsAgo > 30) return false;
+      if (currentFilter !== 'ALL' && pin.project !== currentFilter) return false;
+      return true;
+    });
+
+    if (onlyLatestPerProject) {
+      const latestMap = new Map();
+      visiblePins.forEach((pin) => {
+        const existing = latestMap.get(pin.project);
+        if (!existing || pin.time >= existing.time) {
+          latestMap.set(pin.project, pin);
+        }
+      });
+      visiblePins = Array.from(latestMap.values());
+    }
+
+    visiblePins.forEach((pin) => {
+      const minsAgo = Math.max(0, Math.floor((now - pin.time) / 60000));
+      const safeStatus = VALID_STATUSES.has(pin.status) ? pin.status : 'mid';
+
+      const el = document.createElement('div');
+      el.className = 'pin';
+      el.style.left = `${pin.x}%`;
+      el.style.top = `${pin.y}%`;
+
+      const badge = document.createElement('div');
+      badge.className = `pin-badge status-${safeStatus}`;
+
+      const projectSpan = document.createElement('span');
+      projectSpan.textContent = pin.project;
+      badge.appendChild(projectSpan);
+
+      const timeSpan = document.createElement('span');
+      timeSpan.className = 'pin-time';
+      timeSpan.textContent = `· ${minsAgo === 0 ? '刚刚' : `${minsAgo}分前`}`;
+      badge.appendChild(timeSpan);
+
+      if (pin.hasPhoto) {
+        const camSpan = document.createElement('span');
+        camSpan.textContent = '📷';
+        badge.appendChild(camSpan);
+      }
+
+      const arrow = document.createElement('div');
+      arrow.className = 'pin-arrow';
+
+      el.appendChild(badge);
+      el.appendChild(arrow);
+
+      el.addEventListener('click', (e) => {
+        e.stopPropagation();
+        showDetail(pin, minsAgo);
+      });
+
+      layer.appendChild(el);
+    });
+  }
+
+  // ================= 5. 表单交互与图片前端压缩 =================
+  const submitBtn = document.getElementById('submit-btn');
+
+  document.getElementById('photo-input').addEventListener('change', function (e) {
+    const file = e.target.files && e.target.files[0];
+    const preview = document.getElementById('photo-preview');
+    if (!file) {
+      compressedBase64 = '';
+      preview.style.display = 'none';
+      return;
+    }
+
+    isCompressingPhoto = true;
+    submitBtn.disabled = true;
+    submitBtn.textContent = '正在压缩照片...';
+
+    const reader = new FileReader();
+    reader.onerror = () => {
+      isCompressingPhoto = false;
+      submitBtn.disabled = false;
+      submitBtn.textContent = '发布队尾位置';
+      showToast('照片读取失败，请重试');
+    };
+    reader.onload = function (event) {
+      const img = new Image();
+      img.onerror = () => {
+        isCompressingPhoto = false;
+        submitBtn.disabled = false;
+        submitBtn.textContent = '发布队尾位置';
+        showToast('不支持的图片格式，请重新选择');
+      };
+      img.onload = function () {
+        const c = document.createElement('canvas');
+        const maxW = 600;
+        const ratio = img.width > 0 ? Math.min(1, maxW / img.width) : 1;
+        c.width = Math.max(1, Math.round(img.width * ratio));
+        c.height = Math.max(1, Math.round(img.height * ratio));
+        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+        compressedBase64 = c.toDataURL('image/jpeg', 0.7);
+        preview.src = compressedBase64;
+        preview.style.display = 'block';
+        isCompressingPhoto = false;
+        submitBtn.disabled = false;
+        submitBtn.textContent = '发布队尾位置';
+      };
+      img.src = event.target.result;
+    };
+    reader.readAsDataURL(file);
+  });
+
+  function openAddModal(x, y) {
+    const lastPost = safeGetStorage('last_post_time');
+    if (lastPost && Date.now() - Number(lastPost) < POST_COOLDOWN_MS) {
+      const remainSec = Math.ceil((POST_COOLDOWN_MS - (Date.now() - Number(lastPost))) / 1000);
+      showToast(`你刚刚已经提交过位置啦，请 ${remainSec} 秒后再试~`);
+      return;
+    }
+    pendingCoords = { x, y };
+    compressedBase64 = '';
+    isCompressingPhoto = false;
+    submitBtn.disabled = false;
+    submitBtn.textContent = '发布队尾位置';
+    document.getElementById('photo-input').value = '';
+    document.getElementById('photo-preview').style.display = 'none';
+    document.getElementById('add-modal').classList.add('show');
+  }
+
+  async function submitPin() {
+    if (!sbClient) {
+      showToast('Supabase 未连接，请检查网络');
+      return;
+    }
+    if (isCompressingPhoto) {
+      showToast('照片仍在压缩中，请稍等一下');
+      return;
+    }
+
+    submitBtn.disabled = true;
+    submitBtn.textContent = '正在发布...';
+
+    const projectEl = document.querySelector('#project-tags .selected');
+    const statusEl = document.querySelector('#status-tags .selected');
+    const payload = {
+      project: projectEl ? projectEl.dataset.val : PROJECTS[0],
+      status: statusEl ? statusEl.dataset.val : 'low',
+      status_text: statusEl ? statusEl.dataset.text : '人少(<10分)',
+      x: pendingCoords.x,
+      y: pendingCoords.y,
+      photo: compressedBase64
+    };
+
+    try {
+      const { error } = await sbClient.from('queue_pins').insert([payload]);
+      if (error) {
+        console.error('提交失败:', error);
+        showToast('发布失败：' + error.message, 3600);
+        return;
+      }
+
+      safeSetStorage('last_post_time', Date.now());
+      closeModal('add-modal');
+      showToast('队尾位置发布成功！');
+      await fetchPins(true);
+    } catch (err) {
+      console.error('提交异常:', err);
+      showToast('网络异常，发布失败');
+    } finally {
+      submitBtn.disabled = false;
+      submitBtn.textContent = '发布队尾位置';
+    }
+  }
+  submitBtn.addEventListener('click', submitPin);
+
+  // 点击图钉按需懒加载单张 photo（带内存缓存）
+  async function showDetail(pin, minsAgo) {
+    activeDetailPinId = pin.id;
+    document.getElementById('detail-title').textContent = `${pin.project} - 队尾详情`;
+    document.getElementById('detail-meta').textContent =
+      `排队程度：${pin.statusText || '未知'} | 更新于 ${minsAgo === 0 ? '刚刚' : `${minsAgo}分钟前`}`;
+
+    const img = document.getElementById('detail-img');
+    const photoStatus = document.getElementById('detail-photo-status');
+    img.style.display = 'none';
+    img.removeAttribute('src');
+    photoStatus.style.display = 'none';
+    document.getElementById('detail-modal').classList.add('show');
+
+    // 明确无图时直接不发请求
+    if (pin.hasPhoto === false) return;
+
+    // 优先读本地缓存
+    if (photoCache.has(pin.id)) {
+      const cached = photoCache.get(pin.id);
+      if (isSafeDataImage(cached)) {
+        img.src = cached;
+        img.style.display = 'block';
+      }
+      return;
+    }
+
+    if (!sbClient) return;
+    photoStatus.textContent = '⏳ 正在加载队尾照片...';
+    photoStatus.style.display = 'block';
+
+    try {
+      const { data, error } = await sbClient
+        .from('queue_pins')
+        .select('photo')
+        .eq('id', pin.id)
+        .maybeSingle();
+
+      if (activeDetailPinId !== pin.id) return; // 用户已切换到别的弹窗或已关闭
+
+      if (error) {
+        photoStatus.textContent = '⚠️ 照片加载失败';
+        return;
+      }
+
+      const photoStr = data && data.photo ? data.photo : '';
+      photoCache.set(pin.id, photoStr);
+
+      if (isSafeDataImage(photoStr)) {
+        photoStatus.style.display = 'none';
+        img.src = photoStr;
+        img.style.display = 'block';
+      } else {
+        photoStatus.style.display = 'none';
+      }
+    } catch (_) {
+      if (activeDetailPinId === pin.id) {
+        photoStatus.textContent = '⚠️ 网络异常，照片加载失败';
+      }
+    }
+  }
+
+  function closeModal(id) {
+    document.getElementById(id).classList.remove('show');
+    if (id === 'detail-modal') activeDetailPinId = null;
+  }
+
+  // 弹窗关闭按钮、点击遮罩关闭、ESC 关闭
+  document.querySelectorAll('[data-close]').forEach((btn) => {
+    btn.addEventListener('click', () => closeModal(btn.dataset.close));
+  });
+  document.querySelectorAll('.modal-overlay').forEach((overlay) => {
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) closeModal(overlay.id);
+    });
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      closeModal('add-modal');
+      closeModal('detail-modal');
+    }
+  });
+
+  // 页面切回前台时立即同步一次；切后台时自动跳过轮询
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) fetchPins(true);
+  });
+
+  // 页面加载后立即拉取数据，并每 30 秒自动刷新一次（仅在前台运行）
+  fetchPins(true);
+  setInterval(() => fetchPins(false), 30000);
+</script>
+</body>
+</html>
