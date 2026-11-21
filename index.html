@@ -4,8 +4,6 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>体测实时排队地图 - 众包互助</title>
-<!-- 引入 Supabase SDK -->
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
   body {
@@ -322,10 +320,34 @@
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
 <script>
-  // ================= Supabase 配置 =================
+  // ================= Supabase 配置（直连 REST API，无需任何外部 CDN） =================
   const SUPABASE_URL = 'https://ihvervlbgwtrxwvneqqc.supabase.co';
   const SUPABASE_KEY = 'sb_publishable_AtmflmhQfranf1FBvkO60Q_qMWMDei7';
-  const sbClient = window.supabase ? window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY) : null;
+  const REST_ENDPOINT = `${SUPABASE_URL}/rest/v1/queue_pins`;
+
+  async function sbRestFetch(queryString = '', options = {}) {
+    const headers = Object.assign(
+      {
+        apikey: SUPABASE_KEY,
+        Accept: 'application/json'
+      },
+      options.headers || {}
+    );
+    const res = await fetch(`${REST_ENDPOINT}${queryString}`, Object.assign({}, options, { headers }));
+    if (!res.ok) {
+      let msg = `HTTP ${res.status}`;
+      try {
+        const errBody = await res.json();
+        if (errBody && (errBody.message || errBody.error)) {
+          msg = errBody.message || errBody.error;
+        }
+      } catch (_) {}
+      throw new Error(msg);
+    }
+    if (res.status === 204) return null;
+    const text = await res.text();
+    return text ? JSON.parse(text) : null;
+  }
 
   // ================= 0. 体测项目统一配置（后续增减项目只需改这里，并同步 SQL 约束） =================
   const PROJECTS = [
@@ -340,7 +362,7 @@
   ];
   const VALID_STATUSES = new Set(['low', 'mid', 'high']);
   // 冷却限制：测试期间设为 10 秒，正式发论坛建议改为 180000（3分钟）
-  const POST_COOLDOWN_MS = 180000;
+  const POST_COOLDOWN_MS = 10000;
 
   // 安全的 localStorage 封装
   function safeGetStorage(key) {
@@ -490,10 +512,6 @@
   let activeDetailPinId = null;
 
   async function fetchPins(force = false) {
-    if (!sbClient) {
-      document.getElementById('sync-status').textContent = '⚠️ Supabase SDK 未加载';
-      return;
-    }
     if (isFetching) return;
     if (!force && document.hidden) return;
 
@@ -503,35 +521,27 @@
 
     try {
       const thirtyFiveMinsAgo = new Date(Date.now() - 35 * 60000).toISOString();
-      const selectFields = supportsHasPhotoColumn
-        ? 'id, project, status, status_text, x, y, created_at, has_photo'
-        : 'id, project, status, status_text, x, y, created_at';
+      const buildQuery = (withHasPhoto) => {
+        const fields = withHasPhoto
+          ? 'id,project,status,status_text,x,y,created_at,has_photo'
+          : 'id,project,status,status_text,x,y,created_at';
+        return `?select=${encodeURIComponent(fields)}&created_at=gte.${encodeURIComponent(thirtyFiveMinsAgo)}&order=created_at.asc`;
+      };
 
-      let { data, error } = await sbClient
-        .from('queue_pins')
-        .select(selectFields)
-        .gte('created_at', thirtyFiveMinsAgo)
-        .order('created_at', { ascending: true });
-
-      // 若尚未执行升级 SQL（缺少 has_photo 字段），自动降级查询，不中断使用
-      if (error && supportsHasPhotoColumn && /has_photo/i.test(error.message || '')) {
-        supportsHasPhotoColumn = false;
-        const retry = await sbClient
-          .from('queue_pins')
-          .select('id, project, status, status_text, x, y, created_at')
-          .gte('created_at', thirtyFiveMinsAgo)
-          .order('created_at', { ascending: true });
-        data = retry.data;
-        error = retry.error;
+      let data;
+      try {
+        data = await sbRestFetch(buildQuery(supportsHasPhotoColumn));
+      } catch (err) {
+        // 若尚未执行升级 SQL（缺少 has_photo 字段），自动降级查询，不中断使用
+        if (supportsHasPhotoColumn && /has_photo/i.test(err.message || '')) {
+          supportsHasPhotoColumn = false;
+          data = await sbRestFetch(buildQuery(false));
+        } else {
+          throw err;
+        }
       }
 
-      if (error) {
-        console.error('拉取数据失败:', error);
-        statusTip.textContent = '⚠️ 同步失败，请检查网络或 RLS 权限';
-        return;
-      }
-
-      pinsData = (data || []).map((row) => ({
+      pinsData = (Array.isArray(data) ? data : []).map((row) => ({
         id: row.id,
         project: String(row.project || ''),
         status: VALID_STATUSES.has(row.status) ? row.status : 'mid',
@@ -545,8 +555,8 @@
       statusTip.textContent = '👆 点击地图任意处标出队尾';
       renderPins();
     } catch (err) {
-      console.error('拉取异常:', err);
-      statusTip.textContent = '⚠️ 网络异常，稍后自动重试';
+      console.error('拉取数据失败:', err);
+      statusTip.textContent = '⚠️ 同步失败，请检查网络或 RLS 权限';
     } finally {
       isFetching = false;
     }
@@ -849,10 +859,6 @@
   }
 
   async function submitPin() {
-    if (!sbClient) {
-      showToast('Supabase 未连接，请检查网络');
-      return;
-    }
     if (isCompressingPhoto) {
       showToast('照片仍在压缩中，请稍等一下');
       return;
@@ -873,20 +879,22 @@
     };
 
     try {
-      const { error } = await sbClient.from('queue_pins').insert([payload]);
-      if (error) {
-        console.error('提交失败:', error);
-        showToast('发布失败：' + error.message, 3600);
-        return;
-      }
+      await sbRestFetch('', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Prefer: 'return=minimal'
+        },
+        body: JSON.stringify([payload])
+      });
 
       safeSetStorage('last_post_time', Date.now());
       closeModal('add-modal');
       showToast('队尾位置发布成功！');
       await fetchPins(true);
     } catch (err) {
-      console.error('提交异常:', err);
-      showToast('网络异常，发布失败');
+      console.error('提交失败:', err);
+      showToast('发布失败：' + (err.message || '网络异常'), 3600);
     } finally {
       submitBtn.disabled = false;
       submitBtn.textContent = '发布队尾位置';
@@ -921,25 +929,16 @@
       return;
     }
 
-    if (!sbClient) return;
     photoStatus.textContent = '⏳ 正在加载队尾照片...';
     photoStatus.style.display = 'block';
 
     try {
-      const { data, error } = await sbClient
-        .from('queue_pins')
-        .select('photo')
-        .eq('id', pin.id)
-        .maybeSingle();
+      const rows = await sbRestFetch(`?select=photo&id=eq.${encodeURIComponent(pin.id)}&limit=1`);
 
       if (activeDetailPinId !== pin.id) return; // 用户已切换到别的弹窗或已关闭
 
-      if (error) {
-        photoStatus.textContent = '⚠️ 照片加载失败';
-        return;
-      }
-
-      const photoStr = data && data.photo ? data.photo : '';
+      const first = Array.isArray(rows) && rows.length > 0 ? rows[0] : null;
+      const photoStr = first && first.photo ? first.photo : '';
       photoCache.set(pin.id, photoStr);
 
       if (isSafeDataImage(photoStr)) {
